@@ -8,12 +8,13 @@ import (
 	"github.com/aws/aws-sdk-go/service/autoscaling"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"go.uber.org/zap"
+	"log"
 	"os"
 )
 
 type Request struct {
-	ID float64 `json:"id"`
-	Value string `json:"value"`
+	ID    float64 `json:"id"`
+	Value string  `json:"value"`
 }
 
 func Handler(request Request) (response string, err error) {
@@ -31,26 +32,18 @@ func Handler(request Request) (response string, err error) {
 		logger.Error("Failed to create session", zap.Error(err))
 		return response, err
 	}
+	ec2Svc := ec2.New(sess)
+	autoscalingSvc := autoscaling.New(sess)
 
-	autoscalingSvc := autoscaling.New(sess, &aws.Config{Region: aws.String(region)})
-	ec2Svc := ec2.New(sess, &aws.Config{Region: aws.String(region)})
-
-	asgResponse, err := autoscalingSvc.DescribeAutoScalingGroups(&autoscaling.DescribeAutoScalingGroupsInput{
-		AutoScalingGroupNames: []*string{aws.String(asgName)},
-	})
-	logger.Info("asd", zap.Any("asd", asgResponse))
+	asgIPs, err := getASGPublicIPs(request, asgName, logger, autoscalingSvc, ec2Svc)
 	if err != nil {
-		logger.Error("Failed to describe autoscaling groups", zap.Error(err))
+		logger.Error("Failed to get ASG Public IPs", zap.Error(err))
 		return response, err
 	}
-	if asgResponse.String() == "{\n\n}" {
-		err = errors.New("autoscaling group response is empty")
-		logger.Error("Error", zap.Error(err))
-		return response, err
-	}
+	logger.Info("AutoScaling Group's IPs", zap.Any("asgIPs", asgIPs))
 
 	sgResponse, err := ec2Svc.DescribeSecurityGroups(&ec2.DescribeSecurityGroupsInput{
-		GroupIds:   []*string{
+		GroupIds: []*string{
 			aws.String(sgID),
 		},
 	})
@@ -58,88 +51,130 @@ func Handler(request Request) (response string, err error) {
 		logger.Error("Failed to describe security groups", zap.Error(err))
 		return response, err
 	}
-	logger.Info("asd", zap.Any("asd", sgResponse))
 
-	// Check number of instances. If 0, move to SG update
-	numberOfAsgInstances := len(asgResponse.AutoScalingGroups[0].Instances)
-	if numberOfAsgInstances == 0 {
-		logger.Info("No instances are running")
+	sgIPs := make(map[string]string)
+	for _, ipRange := range sgResponse.SecurityGroups[0].IpPermissions[0].IpRanges {
+		sgIPs[aws.StringValue(ipRange.CidrIp)] = aws.StringValue(ipRange.CidrIp)
+	}
+	logger.Info("Security Group's IPs", zap.Any("sgIPs", sgIPs))
 
-		if len(sgResponse.SecurityGroups[0].IpPermissions) != 0 {
-			_, err := ec2Svc.RevokeSecurityGroupIngress(&ec2.RevokeSecurityGroupIngressInput{
-				GroupId: aws.String(sgID),
-				IpPermissions: sgResponse.SecurityGroups[0].IpPermissions,
-			})
-			if err != nil {
-				logger.Error("Failed to revoke all security group Ingress", zap.Error(err))
-				return response, err
-			}
-			logger.Info(fmt.Sprintf("Deleted all security group rules from SG %s because there were no instances running for the ASG %s", sgID, asgName))
+	var ipsToAdd []string
+	for i, _ := range asgIPs {
+		if _, ok := sgIPs[i]; !ok {
+			ipsToAdd = append(ipsToAdd, i)
 		}
-		return response, err
-	} else {
-		// If more than 0, fetch the instances from EC2
-		// Loop through the asgResponse.AutoScalingGroups[0].Instances[i]
-		//ec2Response, err := ec2Svc.DescribeInstances(&ec2.DescribeInstancesInput{
-		//	InstanceIds: []*string{
-		//		asgResponse.AutoScalingGroups[0].Instances[0].InstanceId,
-		//		asgResponse.AutoScalingGroups[0].Instances[1].InstanceId,
-		//	},
-		//})
-		//if err != nil {
-		//	logger.Error("Failed to describe EC2 instances", zap.Error(err))
-		//	return response, err
-		//}
-		//
-		//allPublicIPs := make([]*string, len(asgResponse.AutoScalingGroups[0].Instances))
-		////fmt.Println(ec2Response.Reservations)
-		//
-		//for i, reservation := range ec2Response.Reservations {
-		//	//fmt.Println(reservation)
-		//	allPublicIPs[i] = reservation.Instances[0].PublicIpAddress
-		//}
-		//fmt.Println(*allPublicIPs[0], *allPublicIPs[1])
-		//fmt.Println(len(ec2Response.Reservations))
-		//fmt.Println(allPublicIPs)
+	}
+	logger.Info("IPs to add", zap.Any("ipsToAdd", ipsToAdd))
+
+	var ipsToRemove []string
+	for i, _ := range sgIPs {
+		if _, ok := asgIPs[i]; !ok {
+			ipsToRemove = append(ipsToRemove, i)
+		}
+	}
+	logger.Info("IPs to remove", zap.Any("ipsToRemove", ipsToRemove))
+
+	if len(ipsToAdd) != 0 {
+		var addParams []*ec2.IpPermission
+		for _, v := range ipsToAdd {
+			addParams = append(addParams, &ec2.IpPermission{
+				FromPort: aws.Int64(0),
+				ToPort:   aws.Int64(65535),
+				IpRanges: []*ec2.IpRange{
+					{
+						CidrIp: aws.String(v),
+					},
+				},
+				IpProtocol: aws.String("tcp"),
+			})
+		}
+		logger.Info("IPs to add request", zap.Any("addParams", addParams))
+		res2, err := ec2Svc.AuthorizeSecurityGroupIngress(&ec2.AuthorizeSecurityGroupIngressInput{
+			GroupId:       aws.String(sgID),
+			IpPermissions: addParams,
+		})
+		if err != nil {
+			logger.Error("Failed to add IPs to security group", zap.Error(err))
+			return response, err
+		}
+		logger.Info("AuthorizeSecurityGroupIngress", zap.Any("res2", res2))
 	}
 
-	sg := sgResponse.SecurityGroups[0]
-	allSGCidrs := make([]*string, len(sg.IpPermissions))
-	fmt.Println(allSGCidrs)
-	for i, ipPermission := range sg.IpPermissions {
-		//fmt.Println(reservation)
-		allSGCidrs[i] = ipPermission.IpRanges[0].CidrIp
+	if len(ipsToRemove) != 0 {
+		var removeParams []*ec2.IpPermission
+		for _, v := range ipsToRemove {
+			removeParams = append(removeParams, &ec2.IpPermission{
+				FromPort: aws.Int64(0),
+				ToPort:   aws.Int64(65535),
+				IpRanges: []*ec2.IpRange{
+					{
+						CidrIp: aws.String(v),
+					},
+				},
+				IpProtocol: aws.String("tcp"),
+			})
+		}
+		res3, err := ec2Svc.RevokeSecurityGroupIngress(&ec2.RevokeSecurityGroupIngressInput{
+			GroupId:       aws.String(sgID),
+			IpPermissions: removeParams,
+		})
+		if err != nil {
+			logger.Error("Failed to remove IPs from security group", zap.Error(err))
+			return response, err
+		}
+		logger.Info("RevokeSecurityGroupIngress", zap.Any("res3", res3))
 	}
-	fmt.Println(sg.IpPermissions[0])
-
-	//input := &ec2.AuthorizeSecurityGroupIngressInput{
-	//	GroupId: aws.String(sgID),
-	//	FromPort: aws.Int64(0),
-	//	ToPort: aws.Int64(65535),
-	//	CidrIp: aws.String(fmt.Sprintf("%s/32", *allPublicIPs[0])),
-	//	IpProtocol: aws.String("tcp"),
-	//}
-	//fmt.Println(res)
-	//
-	//res2, err := ec2Svc.AuthorizeSecurityGroupIngress(input)
-	//if err != nil {
-	//	fmt.Println("Failed to update security group")
-	//	return response, err
-	//}
-	//fmt.Println(res2)
 
 	return "All ok!", err
 }
 
+func getASGPublicIPs(event Request, asgName string, logger *zap.Logger, autoscalingSvc *autoscaling.AutoScaling, ec2Svc *ec2.EC2) (map[string]string, error) {
+	ips := make(map[string]string)
+	asgResponse, err := autoscalingSvc.DescribeAutoScalingGroups(&autoscaling.DescribeAutoScalingGroupsInput{
+		AutoScalingGroupNames: []*string{aws.String(asgName)},
+	})
+	if err != nil {
+		logger.Error("Failed to describe autoscaling groups", zap.Error(err))
+		return ips, err
+	}
+	if asgResponse.String() == "{\n\n}" {
+		err = errors.New("autoscaling group response is empty")
+		logger.Error("Error", zap.Error(err))
+		return ips, err
+	}
+	if len(asgResponse.AutoScalingGroups[0].Instances) == 0 {
+		return ips, err
+	}
+
+	var instanceIds []*string
+	for _, instance := range asgResponse.AutoScalingGroups[0].Instances {
+		instanceIds = append(instanceIds, instance.InstanceId)
+	}
+
+	ec2Response, err := ec2Svc.DescribeInstances(&ec2.DescribeInstancesInput{
+		InstanceIds: instanceIds,
+	})
+	if err != nil {
+		logger.Error("Failed to describe EC2 instances", zap.Error(err))
+		return ips, err
+	}
+	for _, reservation := range ec2Response.Reservations {
+		if *reservation.Instances[0].State.Name != "shutting-down" && *reservation.Instances[0].State.Name != "terminated" {
+			ips[aws.StringValue(reservation.Instances[0].PublicIpAddress)+"/32"] = aws.StringValue(reservation.Instances[0].PublicIpAddress)
+		}
+	}
+
+	return ips, err
+}
+
 func main() {
-	fmt.Print("Hello there stranger!")
+	fmt.Println("Hello there stranger!")
 	//lambda.Start(Handler)
 	res, err := Handler(Request{
 		ID: 123,
 	})
 	if err != nil {
-		fmt.Println(err.Error())
-		os.Exit(1)
+		log.Fatal(err)
 	}
-	fmt.Sprint(res)
+	fmt.Println(res)
 }
