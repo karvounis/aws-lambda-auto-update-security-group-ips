@@ -119,7 +119,7 @@ func getIPsToRemove(asgIPs map[string]string, sgIPs map[string]string) (ipsToRem
 
 func getSGIPs(sgID string, ec2Svc *ec2.EC2) (map[string]string, error) {
 	sgIPs := make(map[string]string)
-	sgResponse, err := ec2Svc.DescribeSecurityGroups(&ec2.DescribeSecurityGroupsInput{
+	sgResp, err := ec2Svc.DescribeSecurityGroups(&ec2.DescribeSecurityGroupsInput{
 		GroupIds: []*string{
 			aws.String(sgID),
 		},
@@ -128,8 +128,8 @@ func getSGIPs(sgID string, ec2Svc *ec2.EC2) (map[string]string, error) {
 		return sgIPs, err
 	}
 
-	if len(sgResponse.SecurityGroups[0].IpPermissions) != 0 {
-		for _, ipRange := range sgResponse.SecurityGroups[0].IpPermissions[0].IpRanges {
+	if len(sgResp.SecurityGroups[0].IpPermissions) != 0 {
+		for _, ipRange := range sgResp.SecurityGroups[0].IpPermissions[0].IpRanges {
 			sgIPs[aws.StringValue(ipRange.CidrIp)] = aws.StringValue(ipRange.CidrIp)
 		}
 	}
@@ -138,29 +138,27 @@ func getSGIPs(sgID string, ec2Svc *ec2.EC2) (map[string]string, error) {
 
 func getASGPublicIPs(event Request, asgName string, autoscalingSvc *autoscaling.AutoScaling, ec2Svc *ec2.EC2) (map[string]string, error) {
 	ips := make(map[string]string)
-	asgResponse, err := autoscalingSvc.DescribeAutoScalingGroups(&autoscaling.DescribeAutoScalingGroupsInput{
+	asgResp, err := autoscalingSvc.DescribeAutoScalingGroups(&autoscaling.DescribeAutoScalingGroupsInput{
 		AutoScalingGroupNames: []*string{aws.String(asgName)},
 	})
 	if err != nil {
 		return ips, err
 	}
-	if asgResponse.String() == "{\n\n}" {
+	if asgResp.String() == "{\n\n}" {
 		return ips, errors.New("autoscaling group response is empty")
 	}
-	if len(asgResponse.AutoScalingGroups[0].Instances) == 0 {
-		return ips, err
-	}
 
-	for _, instance := range asgResponse.AutoScalingGroups[0].Instances {
+	for _, instance := range asgResp.AutoScalingGroups[0].Instances {
 		ec2Response, err := ec2Svc.DescribeInstances(&ec2.DescribeInstancesInput{
 			InstanceIds: []*string{instance.InstanceId},
 		})
 		if err != nil {
 			return ips, err
 		}
-		for _, reservation := range ec2Response.Reservations {
-			if *reservation.Instances[0].State.Name != "shutting-down" && *reservation.Instances[0].State.Name != "terminated" {
-				ips[aws.StringValue(reservation.Instances[0].PublicIpAddress)+"/32"] = aws.StringValue(reservation.Instances[0].PublicIpAddress)
+		for _, rsv := range ec2Response.Reservations {
+			rsvInst := rsv.Instances[0]
+			if aws.StringValue(rsvInst.State.Name) != "shutting-down" && aws.StringValue(rsvInst.State.Name) != "terminated" && aws.StringValue(rsvInst.PublicIpAddress) != ""{
+				ips[aws.StringValue(rsvInst.PublicIpAddress)+"/32"] = aws.StringValue(rsvInst.PublicIpAddress)
 			}
 		}
 	}
