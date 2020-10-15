@@ -2,46 +2,64 @@ package main
 
 import (
 	"errors"
-	"fmt"
+	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/autoscaling"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"go.uber.org/zap"
-	"log"
 	"os"
+	"time"
 )
 
-type Request struct {
-	ID    float64 `json:"id"`
-	Value string  `json:"value"`
+type IncomingEvent struct {
+	Version    string    `json:"version"`
+	ID         string    `json:"id"`
+	DetailType string    `json:"detail-type"`
+	Source     string    `json:"source"`
+	AccountID  string    `json:"account"`
+	Region     string    `json:"region"`
+	Resources  []string  `json:"resources"`
+	Detail     Detail    `json:"detail"`
+	Time       time.Time `json:"time"`
 }
 
-func Handler(request Request) (response string, err error) {
+type Detail struct {
+	LifecycleHookName    string `json:"LifecycleHookName"`
+	AutoScalingGroupName string `json:"AutoScalingGroupName"`
+	LifecycleActionToken string `json:"LifecycleActionToken"`
+	LifecycleTransition  string `json:"LifecycleTransition"`
+	EC2InstanceId        string `json:"EC2InstanceId"`
+}
+
+type Response struct {
+	AddedIPs   []string `json:"added_ips"`
+	RemovedIPs []string `json:"removed_ips"`
+}
+
+func main() {
+	lambda.Start(Handler)
+}
+
+func Handler(request IncomingEvent) (response Response, err error) {
 	logger, _ := zap.NewProduction()
 	defer logger.Sync()
 
-	logger.Info("Hello there stranger!")
-
-	asgName := os.Getenv("asgName")
-	sgID := os.Getenv("sgID")
-	region := os.Getenv("region")
-
-	sess, err := session.NewSession(&aws.Config{Region: aws.String(region)})
+	sess, err := session.NewSession(&aws.Config{Region: aws.String(request.Region)})
 	if err != nil {
 		logger.Error("Failed to create session", zap.Error(err))
 		return response, err
 	}
-	ec2Svc := ec2.New(sess)
-	autoscalingSvc := autoscaling.New(sess)
 
-	asgIPs, err := getASGPublicIPs(request, asgName, autoscalingSvc, ec2Svc)
+	ec2Svc := ec2.New(sess)
+	asgIPs, err := getASGPublicIPs(request, autoscaling.New(sess), ec2Svc)
 	if err != nil {
 		logger.Error("Failed to get ASG Public IPs", zap.Error(err))
 		return response, err
 	}
 	logger.Info("AutoScaling Group's IPs", zap.Any("asgIPs", asgIPs))
 
+	sgID := os.Getenv("securityGroupID")
 	sgIPs, err := getSGIPs(sgID, ec2Svc)
 	if err != nil {
 		logger.Error("Failed to get the IPs of the Security Groups", zap.Error(err))
@@ -56,19 +74,19 @@ func Handler(request Request) (response string, err error) {
 	logger.Info("IPs to remove", zap.Any("ipsToRemove", ipsToRemove))
 
 	if len(ipsToAdd) != 0 {
-		var addParams []*ec2.IpPermission
+		var addPermissions []*ec2.IpPermission
 		for _, ip := range ipsToAdd {
-			addParams = append(addParams, &ec2.IpPermission{
+			addPermissions = append(addPermissions, &ec2.IpPermission{
 				FromPort:   aws.Int64(0),
 				ToPort:     aws.Int64(65535),
 				IpRanges:   []*ec2.IpRange{{CidrIp: aws.String(ip)}},
 				IpProtocol: aws.String("tcp"),
 			})
 		}
-		logger.Info("IPs to add request", zap.Any("addParams", addParams))
+
 		_, err := ec2Svc.AuthorizeSecurityGroupIngress(&ec2.AuthorizeSecurityGroupIngressInput{
 			GroupId:       aws.String(sgID),
-			IpPermissions: addParams,
+			IpPermissions: addPermissions,
 		})
 		if err != nil {
 			logger.Error("Failed to add IPs to security group", zap.Error(err))
@@ -77,18 +95,19 @@ func Handler(request Request) (response string, err error) {
 	}
 
 	if len(ipsToRemove) != 0 {
-		var removeParams []*ec2.IpPermission
+		var removePermissions []*ec2.IpPermission
 		for _, v := range ipsToRemove {
-			removeParams = append(removeParams, &ec2.IpPermission{
+			removePermissions = append(removePermissions, &ec2.IpPermission{
 				FromPort:   aws.Int64(0),
 				ToPort:     aws.Int64(65535),
 				IpRanges:   []*ec2.IpRange{{CidrIp: aws.String(v)}},
 				IpProtocol: aws.String("tcp"),
 			})
 		}
+
 		_, err := ec2Svc.RevokeSecurityGroupIngress(&ec2.RevokeSecurityGroupIngressInput{
 			GroupId:       aws.String(sgID),
-			IpPermissions: removeParams,
+			IpPermissions: removePermissions,
 		})
 		if err != nil {
 			logger.Error("Failed to remove IPs from security group", zap.Error(err))
@@ -96,7 +115,7 @@ func Handler(request Request) (response string, err error) {
 		}
 	}
 
-	return "All ok!", err
+	return Response{AddedIPs: ipsToAdd, RemovedIPs: ipsToRemove}, err
 }
 
 func getIPsToAdd(asgIPs map[string]string, sgIPs map[string]string) (ipsToAdd []string) {
@@ -136,10 +155,10 @@ func getSGIPs(sgID string, ec2Svc *ec2.EC2) (map[string]string, error) {
 	return sgIPs, err
 }
 
-func getASGPublicIPs(event Request, asgName string, autoscalingSvc *autoscaling.AutoScaling, ec2Svc *ec2.EC2) (map[string]string, error) {
+func getASGPublicIPs(event IncomingEvent, autoscalingSvc *autoscaling.AutoScaling, ec2Svc *ec2.EC2) (map[string]string, error) {
 	ips := make(map[string]string)
 	asgResp, err := autoscalingSvc.DescribeAutoScalingGroups(&autoscaling.DescribeAutoScalingGroupsInput{
-		AutoScalingGroupNames: []*string{aws.String(asgName)},
+		AutoScalingGroupNames: []*string{aws.String(event.Detail.AutoScalingGroupName)},
 	})
 	if err != nil {
 		return ips, err
@@ -157,22 +176,10 @@ func getASGPublicIPs(event Request, asgName string, autoscalingSvc *autoscaling.
 		}
 		for _, rsv := range ec2Response.Reservations {
 			rsvInst := rsv.Instances[0]
-			if aws.StringValue(rsvInst.State.Name) != "shutting-down" && aws.StringValue(rsvInst.State.Name) != "terminated" && aws.StringValue(rsvInst.PublicIpAddress) != ""{
+			if aws.StringValue(rsvInst.State.Name) != "shutting-down" && aws.StringValue(rsvInst.State.Name) != "terminated" && aws.StringValue(rsvInst.PublicIpAddress) != "" {
 				ips[aws.StringValue(rsvInst.PublicIpAddress)+"/32"] = aws.StringValue(rsvInst.PublicIpAddress)
 			}
 		}
 	}
 	return ips, err
-}
-
-func main() {
-	fmt.Println("Hello there stranger!")
-	//lambda.Start(Handler)
-	res, err := Handler(Request{
-		ID: 123,
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Println(res)
 }
