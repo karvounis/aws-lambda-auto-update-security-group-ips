@@ -70,7 +70,7 @@ func Handler(request IncomingEvent) (response Response, err error) {
 	ipsToAdd := getIPsToAdd(asgIPs, sgIPs)
 	logger.Info("IPs to add", zap.Any("ipsToAdd", ipsToAdd))
 
-	ipsToRemove := getIPsToRemove(asgIPs, sgIPs)
+	ipsToRemove := getIPsToRemove(sgIPs, asgIPs)
 	logger.Info("IPs to remove", zap.Any("ipsToRemove", ipsToRemove))
 
 	if len(ipsToAdd) != 0 {
@@ -118,6 +118,7 @@ func Handler(request IncomingEvent) (response Response, err error) {
 	return Response{AddedIPs: ipsToAdd, RemovedIPs: ipsToRemove}, err
 }
 
+// Calculates which AutoScaling Group IPs cannot be found in the Security Group IPs. These ones will be added to SG.
 func getIPsToAdd(asgIPs map[string]string, sgIPs map[string]string) (ipsToAdd []string) {
 	for i, _ := range asgIPs {
 		if _, ok := sgIPs[i]; !ok {
@@ -127,7 +128,8 @@ func getIPsToAdd(asgIPs map[string]string, sgIPs map[string]string) (ipsToAdd []
 	return ipsToAdd
 }
 
-func getIPsToRemove(asgIPs map[string]string, sgIPs map[string]string) (ipsToRemove []string) {
+// Calculates which Security Group IPs cannot be found in the AutoScaling Group IPs. These ones will be removed from SG.
+func getIPsToRemove(sgIPs map[string]string, asgIPs map[string]string) (ipsToRemove []string) {
 	for i, _ := range sgIPs {
 		if _, ok := asgIPs[i]; !ok {
 			ipsToRemove = append(ipsToRemove, i)
@@ -136,6 +138,7 @@ func getIPsToRemove(asgIPs map[string]string, sgIPs map[string]string) (ipsToRem
 	return ipsToRemove
 }
 
+// Gets a map of the IPs that are already present in the Security Group
 func getSGIPs(sgID string, ec2Svc *ec2.EC2) (map[string]string, error) {
 	sgIPs := make(map[string]string)
 	sgResp, err := ec2Svc.DescribeSecurityGroups(&ec2.DescribeSecurityGroupsInput{
@@ -155,6 +158,7 @@ func getSGIPs(sgID string, ec2Svc *ec2.EC2) (map[string]string, error) {
 	return sgIPs, err
 }
 
+// Gets a map of running public IPs for all instances of the Autoscaling Group
 func getASGPublicIPs(event IncomingEvent, autoscalingSvc *autoscaling.AutoScaling, ec2Svc *ec2.EC2) (map[string]string, error) {
 	ips := make(map[string]string)
 	asgResp, err := autoscalingSvc.DescribeAutoScalingGroups(&autoscaling.DescribeAutoScalingGroupsInput{
