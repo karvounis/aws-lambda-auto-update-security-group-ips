@@ -12,6 +12,7 @@ import (
 	"time"
 )
 
+// IncomingEvent is the event that CloudWatch triggers
 type IncomingEvent struct {
 	Version    string    `json:"version"`
 	ID         string    `json:"id"`
@@ -24,23 +25,32 @@ type IncomingEvent struct {
 	Time       time.Time `json:"time"`
 }
 
+// Detail contain the details of the EC2 lifecycle hook
 type Detail struct {
 	LifecycleHookName    string `json:"LifecycleHookName"`
 	AutoScalingGroupName string `json:"AutoScalingGroupName"`
 	LifecycleActionToken string `json:"LifecycleActionToken"`
 	LifecycleTransition  string `json:"LifecycleTransition"`
-	EC2InstanceId        string `json:"EC2InstanceId"`
+	EC2InstanceID        string `json:"EC2InstanceId"`
 }
 
+// Response returns the list of IPs that were added and removed
 type Response struct {
 	AddedIPs   []string `json:"added_ips"`
 	RemovedIPs []string `json:"removed_ips"`
 }
 
+// HTTPSPort is the port 443
+const HTTPSPort = 443
+// TCPProtocol specifies the tcp protocol
+const TCPProtocol = "tcp"
+
 func main() {
 	lambda.Start(Handler)
 }
 
+// Handler Automatically update (add/remove) a specific security group's rules based on the public IPs of an autoscaling group's managed EC2 instances.
+// This lambda function is initiated by AutoScaling Lifecycle Hooks.
 func Handler(request IncomingEvent) (response Response, err error) {
 	logger, _ := zap.NewProduction()
 	defer logger.Sync()
@@ -77,10 +87,10 @@ func Handler(request IncomingEvent) (response Response, err error) {
 		var addPermissions []*ec2.IpPermission
 		for _, ip := range ipsToAdd {
 			addPermissions = append(addPermissions, &ec2.IpPermission{
-				FromPort:   aws.Int64(0),
-				ToPort:     aws.Int64(65535),
+				FromPort:   aws.Int64(HTTPSPort),
+				ToPort:     aws.Int64(HTTPSPort),
 				IpRanges:   []*ec2.IpRange{{CidrIp: aws.String(ip)}},
-				IpProtocol: aws.String("tcp"),
+				IpProtocol: aws.String(TCPProtocol),
 			})
 		}
 
@@ -98,10 +108,10 @@ func Handler(request IncomingEvent) (response Response, err error) {
 		var removePermissions []*ec2.IpPermission
 		for _, v := range ipsToRemove {
 			removePermissions = append(removePermissions, &ec2.IpPermission{
-				FromPort:   aws.Int64(0),
-				ToPort:     aws.Int64(65535),
+				FromPort:   aws.Int64(HTTPSPort),
+				ToPort:     aws.Int64(HTTPSPort),
 				IpRanges:   []*ec2.IpRange{{CidrIp: aws.String(v)}},
-				IpProtocol: aws.String("tcp"),
+				IpProtocol: aws.String(TCPProtocol),
 			})
 		}
 
@@ -120,7 +130,7 @@ func Handler(request IncomingEvent) (response Response, err error) {
 
 // Calculates which AutoScaling Group IPs cannot be found in the Security Group IPs. These ones will be added to SG.
 func getIPsToAdd(asgIPs map[string]string, sgIPs map[string]string) (ipsToAdd []string) {
-	for i, _ := range asgIPs {
+	for i := range asgIPs {
 		if _, ok := sgIPs[i]; !ok {
 			ipsToAdd = append(ipsToAdd, i)
 		}
@@ -130,7 +140,7 @@ func getIPsToAdd(asgIPs map[string]string, sgIPs map[string]string) (ipsToAdd []
 
 // Calculates which Security Group IPs cannot be found in the AutoScaling Group IPs. These ones will be removed from SG.
 func getIPsToRemove(sgIPs map[string]string, asgIPs map[string]string) (ipsToRemove []string) {
-	for i, _ := range sgIPs {
+	for i := range sgIPs {
 		if _, ok := asgIPs[i]; !ok {
 			ipsToRemove = append(ipsToRemove, i)
 		}
