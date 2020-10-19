@@ -61,6 +61,7 @@ func main() {
 func Handler(request IncomingEvent) (response Response, err error) {
 	logger, _ := zap.NewProduction()
 	defer logger.Sync()
+	logger.Info("IncomingEvent", zap.Any("Request", request))
 
 	sess, err := session.NewSession(&aws.Config{Region: aws.String(request.Region)})
 	if err != nil {
@@ -212,8 +213,12 @@ func getASGPublicIPs(event IncomingEvent, autoscalingSvc *autoscaling.AutoScalin
 		if err != nil {
 			return ips, err
 		}
+
 		for _, rsv := range ec2Response.Reservations {
 			rsvInst := rsv.Instances[0]
+			if event.Detail.LifecycleTransition == "autoscaling:EC2_INSTANCE_TERMINATING" && aws.StringValue(rsvInst.InstanceId) == event.Detail.EC2InstanceID {
+				continue
+			}
 			if aws.StringValue(rsvInst.State.Name) != "shutting-down" && aws.StringValue(rsvInst.State.Name) != "terminated" && aws.StringValue(rsvInst.PublicIpAddress) != "" {
 				ips[aws.StringValue(rsvInst.PublicIpAddress)+"/32"] = aws.StringValue(rsvInst.PublicIpAddress)
 			}
