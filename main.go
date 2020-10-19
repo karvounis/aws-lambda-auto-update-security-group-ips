@@ -42,8 +42,15 @@ type Response struct {
 
 // HTTPSPort is the port 443
 const HTTPSPort = 443
+
 // TCPProtocol specifies the tcp protocol
 const TCPProtocol = "tcp"
+
+// LifecycleActionResultContinue the continue action for the group to take
+const LifecycleActionResultContinue = "CONTINUE"
+
+// LifecycleActionResultAbandon the abandon action for the group to take
+const LifecycleActionResultAbandon = "ABANDON"
 
 func main() {
 	lambda.Start(Handler)
@@ -62,9 +69,11 @@ func Handler(request IncomingEvent) (response Response, err error) {
 	}
 
 	ec2Svc := ec2.New(sess)
-	asgIPs, err := getASGPublicIPs(request, autoscaling.New(sess), ec2Svc)
+	autoscalingSvc := autoscaling.New(sess)
+	asgIPs, err := getASGPublicIPs(request, autoscalingSvc, ec2Svc)
 	if err != nil {
 		logger.Error("Failed to get ASG Public IPs", zap.Error(err))
+		sendResponseToASG(autoscalingSvc, request, LifecycleActionResultAbandon)
 		return response, err
 	}
 	logger.Info("AutoScaling Group's IPs", zap.Any("asgIPs", asgIPs))
@@ -73,6 +82,7 @@ func Handler(request IncomingEvent) (response Response, err error) {
 	sgIPs, err := getSGIPs(sgID, ec2Svc)
 	if err != nil {
 		logger.Error("Failed to get the IPs of the Security Groups", zap.Error(err))
+		sendResponseToASG(autoscalingSvc, request, LifecycleActionResultAbandon)
 		return response, err
 	}
 	logger.Info("Security Group's IPs", zap.Any("sgIPs", sgIPs))
@@ -100,6 +110,7 @@ func Handler(request IncomingEvent) (response Response, err error) {
 		})
 		if err != nil {
 			logger.Error("Failed to add IPs to security group", zap.Error(err))
+			sendResponseToASG(autoscalingSvc, request, LifecycleActionResultAbandon)
 			return response, err
 		}
 	}
@@ -121,11 +132,24 @@ func Handler(request IncomingEvent) (response Response, err error) {
 		})
 		if err != nil {
 			logger.Error("Failed to remove IPs from security group", zap.Error(err))
+			sendResponseToASG(autoscalingSvc, request, LifecycleActionResultAbandon)
 			return response, err
 		}
 	}
 
+	sendResponseToASG(autoscalingSvc, request, LifecycleActionResultContinue)
 	return Response{AddedIPs: ipsToAdd, RemovedIPs: ipsToRemove}, err
+}
+
+// Completes the lifecycle action for the specified token or instance with the specified result.
+func sendResponseToASG(autoscalingSvc *autoscaling.AutoScaling, request IncomingEvent, status string) {
+	autoscalingSvc.CompleteLifecycleAction(&autoscaling.CompleteLifecycleActionInput{
+		AutoScalingGroupName:  aws.String(request.Detail.AutoScalingGroupName),
+		InstanceId:            aws.String(request.Detail.EC2InstanceID),
+		LifecycleActionResult: aws.String(status),
+		LifecycleActionToken:  aws.String(request.Detail.LifecycleActionToken),
+		LifecycleHookName:     aws.String(request.Detail.LifecycleHookName),
+	})
 }
 
 // Calculates which AutoScaling Group IPs cannot be found in the Security Group IPs. These ones will be added to SG.
